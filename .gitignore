@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Build output
+AirMagic.app/
+*.dSYM/
+.build/
+DerivedData/
+
+# Crash reports and logs
+*.ips
+*.log
+
+# Editors and tools
+.vscode/
+.idea/
+.swiftpm/
+xcuserdata/
+.claude/
