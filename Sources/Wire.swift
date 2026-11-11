@@ -163,6 +163,8 @@ final class Parser {
     private(set) var controls = 0
     private(set) var chunks = 0
     private var opcodes: [Int: Int] = [:]
+    /// Other devices the AirPods say they are talking to (opcode 0x11 carries a Bluetooth address).
+    private(set) var peers = Set<String>()
     var trace: ((String) -> Void)?
     private var traced = 0
     /// e.g. "0x4f:12 0x17:800", for diagnostics.
@@ -228,6 +230,9 @@ final class Parser {
                 controls += 1
                 scanned += 12 + size
             } else {
+                if opcode == 0x11, i + 12 <= count {
+                    peers.insert((0..<6).map { String(format: "%02X", b[i + 11 - $0]) }.joined(separator: ":"))
+                }
                 if [2, 4, 8, 12, 14, 43, 46, 79].contains(opcode) { controls += 1 }
                 else if traced < 80 {
                     traced += 1

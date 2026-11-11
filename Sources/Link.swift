@@ -266,12 +266,19 @@ enum Link {
         var code: Int32 = 0
         var why = "stopped"
         var nextStatus = 0.0
+        var warnedSilent = false
 
         loop: while true {
             if terminate { code = 52; why = "terminated"; say("terminated"); break }
             if stdinSaysStop() { why = "stop requested"; say("stop requested"); break }
             if ended(input) || ended(output) { code = 44; why = "the AirPods link ended"; say("link ended: input \(input.streamStatus.rawValue) output \(output.streamStatus.rawValue)"); break }
             session.tick()
+            if !warnedSilent, uptime() - began > 6, !session.rootVersionValid {
+                // Seen with AirPods that are also connected to another device: they keep sending motion
+                // but never answer us, and the case then ends the stream a few seconds after the lid shuts.
+                warnedSilent = true
+                say("WARN earbud silent; other devices: \(parser.peers.sorted().joined(separator: ", "))")
+            }
             pump(0.02)
             for event in drain() {
                 switch event {

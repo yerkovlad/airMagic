@@ -71,6 +71,18 @@ final class Orientation {
     private(set) var accelSize = 0.0
     private(set) var gyroSize = 0.0
     private(set) var pairs = 0
+    /// Size of gravity as the accelerometer reads it at rest, in g.
+    private(set) var referenceMagnitude = 1.0
+    /// Seconds covered by the last pose update.
+    private(set) var lastDt = 0.0
+    /// Rotation rate in the case's frame with the resting offset removed, deg/s.
+    private(set) var gyroBody = V3()
+    /// The raw accelerometer reading in the case's frame, in g.
+    private(set) var accelBody = V3()
+    /// How far the accelerometer may be from 1 g and still correct the tilt. Sliding needs this tight.
+    var gravityTolerance = 0.15
+    /// The direction "up" (against gravity) in the case's frame right now.
+    var upBody: V3 { q.inverse.rotate(referenceGravity).unit }
     /// Spread of the latest still window (gyro deg/s, accel g), for diagnostics.
     private(set) var spreadGyro = 0.0
     private(set) var spreadAccel = 0.0
@@ -106,7 +118,7 @@ final class Orientation {
     @discardableResult
     func feed(_ s: Sample) -> Bool {
         let v = V3(Double(s.x), Double(s.y), Double(s.z)) * 1e-5
-        if s.service == 11 { accel = (v, s.stamp); accelSize = v.norm; return false }
+        if s.service == 11 { accel = (v, s.stamp); accelSize = v.norm; accelBody = v; return false }
         guard s.service == 12, let a = accel, abs(Int64(s.stamp) - Int64(a.stamp)) < 100_000 else { return false }
 
         var dt = 0.0
@@ -122,6 +134,7 @@ final class Orientation {
         lastGyro = s.stamp
         let g = a.v, magnitude = g.norm
         gyroSize = (v - bias).norm
+        gyroBody = v - bias
         pairs += 1
 
         // Collect still samples: they give the gyro's resting offset.
@@ -136,11 +149,11 @@ final class Orientation {
 
         if !ready {
             if seeded, magnitude > 0.95, magnitude < 1.05 {
-                referenceGravity = g.unit; ready = true; window = []
+                referenceGravity = g.unit; referenceMagnitude = magnitude; ready = true; window = []
                 return true
             }
             if let still = stillStretch(span: firstSpan, gyroLimit: firstGyro, accelLimit: firstAccel) {
-                bias = still.bias; referenceGravity = still.gravity.unit
+                bias = still.bias; referenceGravity = still.gravity.unit; referenceMagnitude = still.gravity.norm
                 seeded = true; ready = true; window = []
                 return true
             }
@@ -156,11 +169,12 @@ final class Orientation {
         }
         guard dt > 0 else { return false }
         var omega = (v - bias) * (Double.pi / 180)
-        if magnitude > 0.85 && magnitude < 1.15 {
+        if abs(magnitude - referenceMagnitude) < gravityTolerance {
             let expected = q.inverse.rotate(referenceGravity)
             omega = omega + g.unit.cross(expected) * 0.5      // pull toward gravity
         }
         q = (q * Q.exp(omega * dt)).normalized
+        lastDt = dt
         return true
     }
 }
@@ -176,6 +190,10 @@ final class Aim {
     var up: V3?
     /// Gravity in the case's frame at the centre pose; tells whether it is held the same way.
     var held: V3?
+    /// How far the pointer travels for a given turn: above 1 is faster.
+    var gain = 1.0
+    var invertX = false
+    var invertY = false
 
     var calibrated: Bool { center != nil && right != nil && up != nil }
 
@@ -217,7 +235,7 @@ final class Aim {
         guard abs(d) > 1e-9 else { return nil }
         let x = (v.dot(r) * uu - v.dot(u) * ru) / d
         let y = (v.dot(u) * rr - v.dot(r) * ru) / d
-        return (0.5 + x / 2, 0.5 - y / 2)
+        return (0.5 + (invertX ? -1 : 1) * gain * x / 2, 0.5 - (invertY ? -1 : 1) * gain * y / 2)
     }
 
     // saved between runs
@@ -272,34 +290,174 @@ final class OneEuro {
     func reset() { x = nil; dx = 0 }
 }
 
+// MARK: gyro mouse
+
+/// A relative pointer, like an air mouse: turning the case moves the pointer, and when it stops turning the
+/// pointer stops. Two turning axes are found once (turn it to the right, tip it up); after that the pointer
+/// moves by the rotation rate about each, with a small dead zone, a short median filter that drops the jolt of
+/// a knock, and a gentle acceleration curve (quick turns go further, slow ones stay precise).
+final class GyroMouse {
+    /// Unit rotation axes in the case's frame: turning about `right` (right-hand rule) moves the pointer to the
+    /// right, turning about `up` moves it up.
+    var right: V3?
+    var up: V3?
+    /// Gravity (the accelerometer's rest reading, unit) in the case's frame when calibrated.
+    var held: V3?
+    var gain = 1.0
+    /// Seconds of low-pass on the rotation rate; 0 is raw.
+    var smoothing = 0.0
+
+    var calibrated: Bool { right != nil && up != nil }
+
+    static let deadZone = 2.5              // deg/s: slower turning is ignored
+    private let pixelsPerDegree = 14.0
+
+    private var recent: [(r: Double, u: Double)] = []
+    private var filtered = (r: 0.0, u: 0.0)
+    private(set) var spin = V3()           // radians turned in the current gesture
+    private var active = false
+    private var quiet = 0.0
+
+    var spinDegrees: Double { spin.norm * 180 / Double.pi }
+
+    func resetGesture() { spin = V3(); active = false; quiet = 0 }
+    func resetMotion() { recent = []; filtered = (0, 0) }
+
+    private func median(_ values: [Double]) -> Double {
+        let s = values.sorted()
+        return s[s.count / 2]
+    }
+
+    /// Pointer movement in pixels (x right, y down) for one step of rotation `gyro` (deg/s, case frame).
+    func feed(gyro: V3, dt: Double) -> (dx: Double, dy: Double) {
+        guard let r = right, let u = up, dt > 0, dt < 0.1 else { return (0, 0) }
+        recent.append((gyro.dot(r), gyro.dot(u)))
+        if recent.count > 5 { recent.removeFirst() }
+        // a knock is a spike of a few samples; the median of the last five passes real turning and drops it
+        var wr = median(recent.map { $0.r }), wu = median(recent.map { $0.u })
+        if smoothing > 0 {
+            let k = dt / (smoothing + dt)
+            filtered.r += (wr - filtered.r) * k
+            filtered.u += (wu - filtered.u) * k
+            wr = filtered.r; wu = filtered.u
+        }
+        func dead(_ w: Double) -> Double { abs(w) <= Self.deadZone ? 0 : w - (w > 0 ? Self.deadZone : -Self.deadZone) }
+        wr = dead(wr); wu = dead(wu)
+        let speed = (wr * wr + wu * wu).squareRoot()
+        let k = pixelsPerDegree * gain * (1 + speed / 90) * dt
+        return (wr * k, -wu * k)
+    }
+
+    /// Calibration: follows a turn of the case. Returns its axis (unit, right-hand rule) once the case has turned
+    /// at least `minimumDegrees` and been held still for 0.3 s. A twitch is forgotten.
+    func trackGesture(gyro: V3, dt: Double, minimumDegrees: Double) -> V3? {
+        let speed = gyro.norm
+        if speed > 15 { active = true }
+        guard active else { return nil }
+        if speed >= 6 {
+            quiet = 0
+            spin = spin + gyro * (Double.pi / 180 * dt)
+            return nil
+        }
+        quiet += dt
+        guard quiet >= 0.3 else { return nil }
+        let turned = spin
+        resetGesture()
+        return turned.norm * 180 / Double.pi >= minimumDegrees ? turned.unit : nil
+    }
+
+    /// Some unit vector perpendicular to `v`.
+    static func anyPerpendicular(to v: V3) -> V3 {
+        let probe = abs(v.x) < 0.8 ? V3(1, 0, 0) : V3(0, 1, 0)
+        return v.cross(probe).unit
+    }
+
+    func save(_ defaults: UserDefaults = .standard) {
+        guard let r = right, let u = up, let h = held else { return }
+        defaults.set(r.array, forKey: "gyro.right"); defaults.set(u.array, forKey: "gyro.up"); defaults.set(h.array, forKey: "gyro.held")
+    }
+    func load(_ defaults: UserDefaults = .standard) {
+        right = V3(defaults.array(forKey: "gyro.right") as? [Double])
+        up = V3(defaults.array(forKey: "gyro.up") as? [Double])
+        held = V3(defaults.array(forKey: "gyro.held") as? [Double])
+        if right == nil || up == nil || held == nil { forget(defaults) }
+    }
+    func forget(_ defaults: UserDefaults = .standard) {
+        right = nil; up = nil; held = nil
+        for k in ["gyro.right", "gyro.up", "gyro.held"] { defaults.removeObject(forKey: k) }
+    }
+}
+
 // MARK: taps
 
-/// Spots a sharp knock on the case: the accelerometer jumps while the case is otherwise
-/// moving smoothly. `threshold` is in g (of high-passed acceleration).
+/// Spots a knock on the case. Tuned on recordings of real taps (and of handling that is
+/// not a tap): a knock is a short, sharp spike in the accelerometer after a calm
+/// stretch, while aiming and handling make wider bumps while the case is moving.
+///
+///  - the spike (high-passed acceleration) must exceed `threshold` (in g),
+///  - it must be narrow: at most 10 samples (about 50 ms at 200 Hz) above 40% of its peak,
+///  - the case must have been calm just before: small acceleration wobble and slow rotation.
+///
+/// The verdict comes 100 ms after the impact, so a click uses where the pointer was before it.
 final class TapDetector {
     var threshold: Double
     private var smooth: V3?
     private var lastStamp: UInt64 = 0
-    private var lastTap: UInt64 = 0
+    private var hp: [(t: Double, v: Double)] = []
+    private var gyro: [(t: Double, v: Double)] = []
+    private var candidate: (t0: Double, peak: Double)?
+    private var lastTap = -1e9
+    /// The current high-passed acceleration size, in g.
     private(set) var lastPeak = 0.0
+    /// The largest bump in roughly the last half second (for on-screen feedback).
+    private(set) var recentPeak = 0.0
 
     init(threshold: Double) { self.threshold = threshold }
 
-    /// Feed accelerometer samples. Returns the tap strength when one fires.
+    /// Feed every accelerometer and gyroscope sample. Returns the knock strength when one is confirmed.
     func feed(_ s: Sample) -> Double? {
+        let t = Double(s.stamp) * 1e-6
+        if s.service == 12 {
+            gyro.append((t, V3(Double(s.x), Double(s.y), Double(s.z)).norm * 1e-5))
+            while let f = gyro.first, t - f.t > 0.6 { gyro.removeFirst() }
+            return nil
+        }
         guard s.service == 11 else { return nil }
         let a = V3(Double(s.x), Double(s.y), Double(s.z)) * 1e-5
         guard let base = smooth, s.stamp > lastStamp else { smooth = a; lastStamp = s.stamp; return nil }
         let dt = Double(s.stamp - lastStamp) * 1e-6
         lastStamp = s.stamp
-        guard dt > 0, dt < 0.1 else { smooth = a; return nil }
+        guard dt > 0, dt < 0.1 else { smooth = a; candidate = nil; return nil }
+
         // low-pass with a ~60 ms time constant; what is left is the knock
         let k = dt / (0.06 + dt)
         smooth = base + (a - base) * k
-        let peak = (a - base).norm
-        lastPeak = peak
-        guard threshold > 0, peak > threshold, s.stamp > lastTap + 450_000 else { return nil }
-        lastTap = s.stamp
-        return peak
+        let v = (a - base).norm
+        lastPeak = v
+        recentPeak = max(recentPeak * pow(0.5, dt / 0.4), v)
+        hp.append((t, v))
+        while let f = hp.first, t - f.t > 0.6 { hp.removeFirst() }
+        guard threshold > 0 else { candidate = nil; return nil }
+
+        if var c = candidate {
+            c.peak = max(c.peak, v)
+            candidate = c
+            guard t - c.t0 >= 0.1 else { return nil }
+            candidate = nil
+            return judge(c)
+        }
+        if v > threshold, t > lastTap + 0.45 { candidate = (t, v) }
+        return nil
+    }
+
+    private func judge(_ c: (t0: Double, peak: Double)) -> Double? {
+        let width = hp.filter { abs($0.t - c.t0) <= 0.1 && $0.v > 0.4 * c.peak }.count
+        let before = hp.filter { $0.t >= c.t0 - 0.25 && $0.t < c.t0 - 0.03 }.map { $0.v }
+        let turning = gyro.filter { $0.t >= c.t0 - 0.25 && $0.t < c.t0 - 0.03 }.map { $0.v }
+        let wobble = before.isEmpty ? 0 : before.reduce(0, +) / Double(before.count)
+        let rotation = turning.isEmpty ? 0 : turning.reduce(0, +) / Double(turning.count)
+        guard width <= 10, wobble <= 0.08, rotation <= 25 else { return nil }
+        lastTap = c.t0
+        return c.peak
     }
 }

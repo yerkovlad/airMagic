@@ -38,6 +38,11 @@ enum SelfTest {
         conversation()
         pose()
         taps()
+        gyroMouse()
+        slideMouse()
+        recorder()
+        recordedTaps()
+        recordedSlide()
         print(failures == 0 ? "PASS: \(count) checks" : "FAILED: \(failures) of \(count) checks")
         return failures == 0 ? 0 : 1
     }
@@ -74,6 +79,11 @@ enum SelfTest {
         check(two.count == 2, "two events")
         if case .uarp(let t, let id, let body)? = two.first { check(t == 2 && id == 77 && body == [0, 0, 0, 6], "uarp fields") } else { check(false, "uarp decoded") }
         if case .location(let p, let s)? = two.last { check(p == 3 && s == 2, "location fields") } else { check(false, "location decoded") }
+
+        // another device reported by the AirPods (opcode 0x11 carries its address, reversed)
+        let peerParser = Parser()
+        _ = peerParser.feed([4, 0, 4, 0, 0x11, 0, 0xab, 0x89, 0x67, 0x45, 0x23, 0x01, 0x83, 0, 1, 0xe5])
+        check(peerParser.peers == ["01:23:45:67:89:AB"], "another connected device is noticed")
 
         // names
         check(Wire.modelName(modelReply("AirPods")) == "AirPods", "model name")
@@ -246,23 +256,333 @@ enum SelfTest {
 
     // MARK: taps
 
-    private static func taps() {
-        let d = TapDetector(threshold: 0.25)
-        var stamp: UInt64 = 1_000_000
-        var fired = 0
-        for i in 0..<400 {
-            // gentle sway
-            let sway = 0.02 * sin(Double(i) * 0.05)
-            if d.feed(Sample(service: 11, stamp: stamp, x: raw(sway), y: 0, z: raw(1))) != nil { fired += 1 }
+    /// Feeds 200 Hz accelerometer (and optional gyro) samples; returns the knock strengths heard.
+    private static func knocks(_ d: TapDetector, seconds: Double, from start: UInt64 = 1_000_000,
+                               accel: (Double) -> (Double, Double, Double), gyro: ((Double) -> Double)? = nil) -> [Double] {
+        var heard = [Double]()
+        var stamp = start
+        let end = start + UInt64(seconds * 1e6)
+        while stamp < end {
+            let t = Double(stamp - start) * 1e-6
+            let a = accel(t)
+            if let g = gyro { _ = d.feed(Sample(service: 12, stamp: stamp + 100, x: raw(g(t)), y: 0, z: 0)) }
+            if let k = d.feed(Sample(service: 11, stamp: stamp, x: raw(a.0), y: raw(a.1), z: raw(a.2))) { heard.append(k) }
             stamp += 5000
         }
-        check(fired == 0, "smooth motion is not a tap")
-        let spike = d.feed(Sample(service: 11, stamp: stamp, x: raw(0.8), y: 0, z: raw(1)))
-        check(spike != nil, "a knock is a tap")
-        stamp += 5000
-        check(d.feed(Sample(service: 11, stamp: stamp, x: raw(-0.8), y: 0, z: raw(1))) == nil, "no second tap inside the pause")
-        let off = TapDetector(threshold: 0)
-        _ = off.feed(Sample(service: 11, stamp: 1, x: 0, y: 0, z: raw(1)))
-        check(off.feed(Sample(service: 11, stamp: 5001, x: raw(2), y: 0, z: raw(1))) == nil, "threshold 0 turns taps off")
+        return heard
+    }
+
+    private static func taps() {
+        // a gentle sway is not a knock
+        let sway = knocks(TapDetector(threshold: 0.4), seconds: 2, accel: { (0.03 * sin($0 * 3), 0, 1) })
+        check(sway.isEmpty, "gentle sway is not a tap")
+
+        // a narrow spike after a calm stretch is
+        let spike: (Double) -> (Double, Double, Double) = { t in (t > 1.0 && t < 1.01 ? 0.9 : 0, 0, 1) }
+        let one = knocks(TapDetector(threshold: 0.4), seconds: 2, accel: spike)
+        check(one.count == 1 && one[0] > 0.5, "a narrow spike after calm is a tap")
+
+        // a wide bump (the case being swung) is not
+        let wide = knocks(TapDetector(threshold: 0.4), seconds: 2, accel: { t in (t > 1.0 && t < 1.2 ? 0.7 : 0, 0, 1) })
+        check(wide.isEmpty, "a wide bump is not a tap")
+
+        // a spike while the case is turning fast is not
+        let turning = knocks(TapDetector(threshold: 0.4), seconds: 2, accel: spike, gyro: { _ in 120 })
+        check(turning.isEmpty, "a spike while turning is not a tap")
+
+        // a spike while it sits still is, even with the gyro running
+        let still = knocks(TapDetector(threshold: 0.4), seconds: 2, accel: spike, gyro: { _ in 1 })
+        check(still.count == 1, "a spike with a quiet gyro is a tap")
+
+        // two knocks 0.2 s apart count once; 0.8 s apart count twice
+        let quick = knocks(TapDetector(threshold: 0.4), seconds: 3, accel: { t in ((t > 1.0 && t < 1.01) || (t > 1.2 && t < 1.21) ? 0.9 : 0, 0, 1) })
+        check(quick.count == 1, "quick double knock counts once")
+        let apart = knocks(TapDetector(threshold: 0.4), seconds: 3, accel: { t in ((t > 1.0 && t < 1.01) || (t > 1.8 && t < 1.81) ? 0.9 : 0, 0, 1) })
+        check(apart.count == 2, "knocks 0.8 s apart count twice")
+
+        // below the threshold, and with taps off
+        let soft = knocks(TapDetector(threshold: 0.4), seconds: 2, accel: { t in (t > 1.0 && t < 1.01 ? 0.25 : 0, 0, 1) })
+        check(soft.isEmpty, "a soft knock below the threshold is ignored")
+        let off = knocks(TapDetector(threshold: 0), seconds: 2, accel: spike)
+        check(off.isEmpty, "threshold 0 turns taps off")
+    }
+
+    // MARK: gyro mouse
+
+    private static func calibratedMouse() -> GyroMouse {
+        let m = GyroMouse()
+        m.right = V3(0, 0, 1)        // turning about z moves the pointer right
+        m.up = V3(1, 0, 0)           // turning about x moves it up
+        return m
+    }
+
+    /// Total pixels moved by turning at `gyro` (deg/s) for `seconds`.
+    private static func turn(_ m: GyroMouse, _ gyro: V3, seconds: Double) -> (dx: Double, dy: Double) {
+        var total = (dx: 0.0, dy: 0.0)
+        var t = 0.0
+        while t < seconds {
+            let d = m.feed(gyro: gyro, dt: 0.005)
+            total.dx += d.dx; total.dy += d.dy
+            t += 0.005
+        }
+        return total
+    }
+
+    private static func gyroMouse() {
+        // turning right moves right, tipping up moves up (negative y on the screen)
+        let right = turn(calibratedMouse(), V3(0, 0, 40), seconds: 1)
+        check(right.dx > 300 && abs(right.dy) < 1, "turning right moves the pointer right (got \(right))")
+        let left = turn(calibratedMouse(), V3(0, 0, -40), seconds: 1)
+        check(left.dx < -300 && abs(left.dy) < 1, "turning left moves it left")
+        let up = turn(calibratedMouse(), V3(40, 0, 0), seconds: 1)
+        check(up.dy < -300 && abs(up.dx) < 1, "tipping up moves the pointer up (got \(up))")
+
+        // slow drift of the gyro is ignored, and a stopped case stops the pointer
+        let creep = turn(calibratedMouse(), V3(0, 0, 2), seconds: 5)
+        check(abs(creep.dx) < 0.001, "a slow gyro offset does not move it")
+
+        // quick turns go further per degree than slow ones
+        let slow = turn(calibratedMouse(), V3(0, 0, 20), seconds: 1).dx / 20
+        let fast = turn(calibratedMouse(), V3(0, 0, 120), seconds: 0.2).dx / (120 * 0.2)
+        check(fast > slow * 1.4, "a quick turn is accelerated (\(fast) vs \(slow) px/deg)")
+
+        // a knock (a spike of two samples) does not move it
+        let knock = calibratedMouse()
+        var spike = 0.0
+        for i in 0..<200 {
+            let rate = (i == 100 || i == 101) ? 250.0 : 0.0
+            spike += knock.feed(gyro: V3(0, 0, rate), dt: 0.005).dx
+        }
+        check(abs(spike) < 1, "a knock's jolt is filtered out (got \(spike))")
+
+        // gain scales the movement
+        let fastMouse = calibratedMouse()
+        fastMouse.gain = 2
+        let doubled = turn(fastMouse, V3(0, 0, 40), seconds: 1)
+        check(doubled.dx > right.dx * 1.8, "gain doubles the movement")
+
+        // a calibration turn is found by its axis, and a twitch is not
+        let g = GyroMouse()
+        var found: V3?
+        var t = 0.0
+        while t < 1.5 {
+            let rate = t > 0.2 && t < 0.7 ? 60.0 : 0.0            // 30 degrees about z
+            if let axis = g.trackGesture(gyro: V3(0, 0, rate), dt: 0.005, minimumDegrees: 12) { found = axis }
+            t += 0.005
+        }
+        check(found.map { $0.dot(V3(0, 0, 1)) > 0.99 } == true, "a turn is found by its axis")
+        let h = GyroMouse()
+        var twitch: V3?
+        t = 0.0
+        while t < 1.5 {
+            let rate = t > 0.2 && t < 0.25 ? 60.0 : 0.0            // 3 degrees
+            if let axis = h.trackGesture(gyro: V3(0, 0, rate), dt: 0.005, minimumDegrees: 12) { twitch = axis }
+            t += 0.005
+        }
+        check(twitch == nil, "a twitch is not a turn")
+        let reverse = GyroMouse()
+        var back: V3?
+        t = 0.0
+        while t < 1.5 {
+            let rate = t > 0.2 && t < 0.7 ? -60.0 : 0.0
+            if let axis = reverse.trackGesture(gyro: V3(0, 0, rate), dt: 0.005, minimumDegrees: 12) { back = axis }
+            t += 0.005
+        }
+        check(back.map { $0.dot(V3(0, 0, -1)) > 0.99 } == true, "a turn the other way gives the opposite axis")
+        check(abs(GyroMouse.anyPerpendicular(to: V3(0, 0, 1)).dot(V3(0, 0, 1))) < 1e-9, "a perpendicular axis is perpendicular")
+
+        // inverting an axis flips the aim
+        let aim = Aim()
+        aim.setCenter(.identity, referenceGravity: V3(0, 0, 1))
+        try? aim.setEdge(right: true, Q.exp(V3(0, 0.3, 0)))
+        try? aim.setEdge(right: false, Q.exp(V3(0.3, 0, 0)))
+        aim.invertX = true
+        let flipped = aim.point(Q.exp(V3(0, 0.3, 0)))
+        check(flipped.map { abs($0.x - 0) < 1e-6 && abs($0.y - 0.5) < 1e-6 } == true, "invert left/right flips x")
+        aim.invertX = false; aim.invertY = true
+        let flippedY = aim.point(Q.exp(V3(0.3, 0, 0)))
+        check(flippedY.map { abs($0.x - 0.5) < 1e-6 && abs($0.y - 1) < 1e-6 } == true, "invert up/down flips y")
+    }
+
+    // MARK: slide mouse
+
+    /// Feeds the sliding mouse at 200 Hz: `profile(t)` gives the extra acceleration (g) on top of the rest reading.
+    private static func drive(_ m: SlideMouse, rest: V3, seconds: Double, gyro: V3 = V3(),
+                              profile: (Double) -> V3) -> (dx: Double, dy: Double) {
+        var total = (dx: 0.0, dy: 0.0)
+        var t = 0.0
+        while t < seconds {
+            let step = m.feed(accel: rest + profile(t), gyro: gyro, dt: 0.005)
+            total.dx += step.dx; total.dy += step.dy
+            t += 0.005
+        }
+        return total
+    }
+
+    private static func push(_ axis: V3, _ strength: Double, from: Double = 1.0) -> (Double) -> V3 {
+        { t in
+            if t > from && t < from + 0.3 { return axis * strength }
+            if t >= from + 0.3 && t < from + 0.6 { return axis * (-strength) }
+            return V3()
+        }
+    }
+
+    private static func slideMouse() {
+        let rest = V3(0.1, 0.0, 0.99)
+        func calibrated() -> SlideMouse {
+            let m = SlideMouse()
+            m.right = V3(1, 0, 0); m.forward = V3(0, 1, 0)
+            return m
+        }
+        // right moves right, away moves up (negative y)
+        let right = drive(calibrated(), rest: rest, seconds: 3, profile: push(V3(1, 0, 0), 0.1))
+        check(right.dx > 150 && abs(right.dy) < 20, "sliding right moves the pointer right (got \(right))")
+        let left = drive(calibrated(), rest: rest, seconds: 3, profile: push(V3(-1, 0, 0), 0.1))
+        check(left.dx < -150, "sliding left moves it left")
+        let away = drive(calibrated(), rest: rest, seconds: 3, profile: push(V3(0, 1, 0), 0.1))
+        check(away.dy < -150 && abs(away.dx) < 20, "sliding away moves it up (got \(away))")
+
+        // at rest, with sensor noise and a slow tilt, it does not creep
+        var seed: UInt64 = 7
+        func noise() -> Double {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            return (Double(seed >> 33) / Double(1 << 31) - 0.5) * 0.017          // about 0.005 g
+        }
+        let creep = drive(calibrated(), rest: rest, seconds: 20, profile: { t in V3(noise() + 0.004 * t / 20, noise(), noise()) })
+        check(abs(creep.dx) < 30 && abs(creep.dy) < 30, "at rest it does not creep (got \(creep))")
+
+        // a hard bump straight up and down pauses it instead of moving it
+        let bump = drive(calibrated(), rest: rest, seconds: 2, profile: { t in
+            t > 1.0 && t < 1.02 ? V3(0.2, 0, 0.9) : (t >= 1.02 && t < 1.04 ? V3(-0.2, 0, -0.9) : V3())
+        })
+        check(abs(bump.dx) < 15, "a bump is not a slide (got \(bump))")
+
+        // a gentle stroke with noise is still seen; the calibration reads its direction
+        let found = SlideMouse()
+        _ = drive(found, rest: V3(0, 0, 1), seconds: 3, profile: { t in
+            let direction = V3(0.6, 0.8, 0)
+            let p = push(direction, 0.12)(t)
+            return V3(p.x + noise(), p.y + noise(), p.z + noise())
+        })
+        let stroke = found.takeStroke()
+        check(stroke.map { $0.dot(V3(0.6, 0.8, 0)) > 0.95 } == true, "a calibration stroke gives its direction")
+        let back = SlideMouse()
+        _ = drive(back, rest: V3(0, 0, 1), seconds: 3, profile: push(V3(0.6, 0.8, 0), -0.12))
+        check(back.takeStroke().map { $0.dot(V3(-0.6, -0.8, 0)) > 0.95 } == true, "the opposite stroke gives the opposite direction")
+        let twitch = SlideMouse()
+        _ = drive(twitch, rest: V3(0, 0, 1), seconds: 3, profile: push(V3(1, 0, 0), 0.03))
+        check(twitch.takeStroke() == nil, "a tiny twitch is not a stroke")
+
+        // gain scales the movement
+        let strong = calibrated()
+        strong.gain = 2
+        let doubled = drive(strong, rest: rest, seconds: 3, profile: push(V3(1, 0, 0), 0.1))
+        check(doubled.dx > right.dx * 1.8, "gain doubles the movement")
+    }
+
+    /// With AIRMAGIC_SLIDE_CSV=/path/slide-test.csv, runs the sliding mouse over a real recording and prints
+    /// the movement per step of the script (cm along the two surface axes), to compare with the prototype.
+    private static func recordedSlide() {
+        guard let path = ProcessInfo.processInfo.environment["AIRMAGIC_SLIDE_CSV"],
+              let text = try? String(contentsOfFile: path, encoding: .utf8) else { return }
+        var samples: [Sample] = []
+        var markers: [(stamp: UInt64, label: String)] = []
+        for line in text.split(separator: "\n") where !line.hasPrefix("#") {
+            let f = line.split(separator: ",")
+            if f[0] == "S", f.count == 6, let sv = Int(f[1]), let us = UInt64(f[2]), let x = Int32(f[3]), let y = Int32(f[4]), let z = Int32(f[5]) {
+                samples.append(Sample(service: sv, stamp: us, x: x, y: y, z: z))
+            } else if f[0] == "M", f.count == 3, let us = UInt64(f[1]) {
+                markers.append((us, String(f[2])))
+            }
+        }
+        guard let first = samples.first else { return }
+        if !markers.isEmpty { markers[0].stamp = first.stamp }
+        // rest reading and gyro offset from the first stretch (0.5 s to 4.5 s)
+        let early = samples.filter { $0.stamp >= first.stamp + 500_000 && $0.stamp < first.stamp + 4_500_000 }
+        let acc = early.filter { $0.service == 11 }, gyr = early.filter { $0.service == 12 }
+        func avg(_ v: [Sample]) -> V3 {
+            V3(v.map { Double($0.x) }.reduce(0, +), v.map { Double($0.y) }.reduce(0, +), v.map { Double($0.z) }.reduce(0, +)) * (1e-5 / Double(v.count))
+        }
+        let rest = avg(acc), gyroOffset = avg(gyr)
+        let up = rest.unit
+        let e1 = up.cross(V3(1, 0, 0)).unit
+        let e2 = up.cross(e1).unit
+        let m = SlideMouse()
+        m.right = e2; m.forward = e1            // the axes the prototype used: right is e2, away is e1
+        var gyro = V3()
+        var last: UInt64 = 0
+        var cumulative = [(stamp: UInt64, e1: Double, e2: Double)]()
+        var px = (e1: 0.0, e2: 0.0)
+        for s in samples {
+            let v = V3(Double(s.x), Double(s.y), Double(s.z)) * 1e-5
+            if s.service == 12 { gyro = v - gyroOffset; continue }
+            let dt = last == 0 ? 0.005 : Double(s.stamp - last) * 1e-6
+            last = s.stamp
+            let step = m.feed(accel: v, gyro: gyro, dt: dt)
+            px.e2 += step.dx / (SlideMouse.pixelsPerMetre * m.gain) * 100
+            px.e1 += -step.dy / (SlideMouse.pixelsPerMetre * m.gain) * 100
+            cumulative.append((s.stamp, px.e1, px.e2))
+        }
+        var previous = (e1: 0.0, e2: 0.0)
+        print("recorded slide test, movement per step (cm): e1 e2")
+        for (i, mk) in markers.enumerated() {
+            let end = i + 1 < markers.count ? markers[i + 1].stamp : (samples.last?.stamp ?? 0)
+            guard let at = cumulative.last(where: { $0.stamp <= end - 50_000 }) else { continue }
+            print(String(format: "  %-18@ %7.1f %7.1f", mk.label as NSString, at.e1 - previous.e1, at.e2 - previous.e2))
+            previous = (at.e1, at.e2)
+        }
+    }
+
+    // MARK: recorder
+
+    private static func recorder() {
+        let r = SlideRecorder()
+        r.begin(now: 0)
+        var stamp: UInt64 = 1000
+        var prompts = Set<String>()
+        var now = 0.0
+        while let step = r.tick(now: now) {
+            prompts.insert(step.prompt)
+            r.add([Sample(service: 11, stamp: stamp, x: 1, y: 2, z: 3), Sample(service: 12, stamp: stamp + 100, x: 4, y: 5, z: 6)])
+            stamp += 5000
+            now += 0.5
+        }
+        check(now >= SlideRecorder.duration - 1 && now <= SlideRecorder.duration + 1, "the script runs for its length")
+        check(prompts.count >= 12, "the script gives many different prompts")
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("airmagic-recorder-test.csv")
+        try? r.write(to: url)
+        let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+        let lines = text.split(separator: "\n")
+        check(lines.first?.hasPrefix("# ") == true, "the file starts with a comment")
+        check(lines.filter { $0.hasPrefix("S,") }.count == r.samples.count, "every sample is written")
+        check(lines.filter { $0.hasPrefix("M,") }.count == SlideRecorder.script.count, "every step has a marker")
+        check(text.contains("M,") && text.contains(",diag-away-right"), "markers carry their labels")
+        try? FileManager.default.removeItem(at: url)
+    }
+
+    // MARK: recorded taps (optional)
+
+    /// With AIRMAGIC_TAP_FIXTURES=/path/TapFixtures.csv (segment,service,µs,x,y,z), runs the detector on
+    /// real recordings: 15 soft taps on a closed case in the hand, and handling with no taps.
+    private static func recordedTaps() {
+        guard let path = ProcessInfo.processInfo.environment["AIRMAGIC_TAP_FIXTURES"],
+              let text = try? String(contentsOfFile: path, encoding: .utf8) else { return }
+        var segments: [String: [Sample]] = [:]
+        for line in text.split(separator: "\n") where !line.hasPrefix("#") {
+            let f = line.split(separator: ",")
+            guard f.count == 6, let service = Int(f[1]), let us = UInt64(f[2]),
+                  let x = Int32(f[3]), let y = Int32(f[4]), let z = Int32(f[5]) else { continue }
+            segments[String(f[0]), default: []].append(Sample(service: service, stamp: us, x: x, y: y, z: z))
+        }
+        func count(_ name: String, _ threshold: Double) -> Int {
+            let d = TapDetector(threshold: threshold)
+            return (segments[name] ?? []).reduce(0) { $0 + (d.feed($1) == nil ? 0 : 1) }
+        }
+        let held = count("held", 0.4)
+        check(held == 15, "recorded: all 15 soft taps on the closed case found (got \(held))")
+        let walking = count("pointing", 0.4)
+        check(walking <= 2, "recorded: aiming around makes at most 2 false taps (got \(walking))")
+        let others = segments.keys.filter { $0.contains("-") }.reduce(0) { $0 + count($1, 0.4) }
+        print("recorded: held \(held)/15, pointing \(walking), other handling \(others) false taps")
     }
 }
